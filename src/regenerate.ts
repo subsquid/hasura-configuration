@@ -5,6 +5,7 @@ import inquirer from "inquirer"
 import {getMetadataArgsStorage} from "typeorm"
 import {MetadataArgsStorage} from "typeorm/metadata-args/MetadataArgsStorage"
 import {RelationTypeInFunction} from "typeorm/metadata/types/RelationTypeInFunction"
+import {PropertyTypeFactory} from "typeorm/metadata/types/PropertyTypeInFunction"
 import {runProgram} from "@subsquid/util-internal"
 import {toSnakeCase} from "@subsquid/util-naming"
 import {registerTsNodeIfRequired, isTsNode} from "@subsquid/util-internal-ts-node"
@@ -74,9 +75,11 @@ function validateBaseConfig(config: any): void {
 
 type RelationshipRecord = {
     from: string
+    name: string
     field: string
     to: string
     oneToOne: boolean
+    inverseRelationshipName?: string
 }
 
 
@@ -97,27 +100,92 @@ function tableName(entityTarget: string | Function): string {
 
 function getRelationshipsData(metadata: MetadataArgsStorage): RelationshipRecord[] {
     const out: RelationshipRecord[] = []
+
     for (let rel of metadata.relations) {
-        // relationships marked as one-to-many are derived and should be ignored here
+        // relationships marked as one-to-many are derived but optional;
+        // their name and presence is identified via the inversePresent flag on the second pass
         if (rel.relationType === 'many-to-one') {
             out.push({
                 from: tableName(rel.target),
-                field: `${rel.propertyName}_id`,
+                name: rel.propertyName,
+                field: `${toSnakeCase(rel.propertyName)}_id`,
                 to: typeToTableName(rel.type),
-                oneToOne: false
+                oneToOne: false,
+                inverseRelationshipName: undefined
             })
         }
-        // relationships with defined .inverseSideProperty are derived and should be ignored here
+        // names of the inverse one-to-one relationships are identified on the second pass
         if (rel.relationType === 'one-to-one' && rel.inverseSideProperty === undefined) {
             out.push({
                 from: tableName(rel.target),
-                field: `${rel.propertyName}_id`,
+                name: rel.propertyName,
+                field: `${toSnakeCase(rel.propertyName)}_id`,
                 to: typeToTableName(rel.type),
-                oneToOne: true
+                oneToOne: true,
+                inverseRelationshipName: undefined
             })
         }
     }
+
+    // doing the second pass to set names of all inverse relationships
+    for (let rel of metadata.relations) {
+        if (rel.relationType === 'one-to-many') {
+            const from = tableName(rel.target)
+            const type = typeToTableName(rel.type)
+            const inversePropertyName = inverseSidePropertyToPropertyName(rel.inverseSideProperty!)
+
+            const recordToUpdate = out.find(r => (
+                r.from === type &&
+                r.name === inversePropertyName &&
+                r.to === from &&
+                !r.oneToOne
+            ))
+
+            if (recordToUpdate === undefined) {
+                console.log('WARNING! Found a one-to-many relationship that not mathing any many-to-one relationships\n', rel, '\nSkipping')
+            }
+            else {
+                recordToUpdate.inverseRelationshipName = rel.propertyName
+            }
+        }
+        if (rel.relationType === 'one-to-one' && rel.inverseSideProperty !== undefined) {
+            const from = tableName(rel.target)
+            const type = typeToTableName(rel.type)
+            const inversePropertyName = inverseSidePropertyToPropertyName(rel.inverseSideProperty!)
+
+            const recordToUpdate = out.find(r => (
+                r.from === type &&
+                r.name === inversePropertyName &&
+                r.to === from &&
+                r.oneToOne
+            ))
+
+            if (recordToUpdate === undefined) {
+                console.log('WARNING! Found a one-to-many relationship that not mathing any many-to-one relationships\n', rel, '\nSkipping')
+            }
+            else {
+                recordToUpdate.inverseRelationshipName = rel.propertyName
+            }
+        }
+    }
+
     return out
+}
+
+
+function inverseSidePropertyToPropertyName(prop: PropertyTypeFactory<any>): string {
+    try {
+        let callableType: any = prop
+        let propName = callableType.toString().split('.')[1] // a typical body of these functions reads 'e => e.<propName>'
+        // Hacky! But this is the best option available in TypeORM
+        // If you know a better way, open an issue at https://github.com/subsquid/hasura-configuration/
+        assert(propName)
+        return propName as string
+    }
+    catch (e) {
+        console.error(`Unexpected value returned by TypeORM for an inverse side property`, e, prop)
+        process.exit(1)
+    }
 }
 
 
@@ -129,7 +197,7 @@ function typeToTableName(rtype: RelationTypeInFunction): string {
         return toSnakeCase(tableName as string)
     }
     catch (e) {
-        console.error(`Non-callable type returned by TypeORM for a relation, or the value returned by the call has no "name" field`, e, rtype)
+        console.error(`Unexpected value returned by TypeORM for a relation type`, e, rtype)
         process.exit(1)
     }
 }
@@ -146,43 +214,47 @@ function updateHasuraTablesWithRelationshipsConfig(hasuraTables: any[], relation
     for (let rel of relationships) {
         if (rel.oneToOne) {
             updateArrayMap(objectRelationships, rel.from, {
-                name: rel.to,
+                name: rel.name,
                 using: {
                     foreign_key_constraint_on: rel.field
                 }
             })
-            updateArrayMap(objectRelationships, rel.to, {
-                name: rel.from,
-                using: {
-                    foreign_key_constraint_on: {
-                        column: rel.field,
-                        table: {
-                            name: rel.from,
-                            schema: 'public'
+            if (rel.inverseRelationshipName !== undefined) {
+                updateArrayMap(objectRelationships, rel.to, {
+                    name: rel.inverseRelationshipName,
+                    using: {
+                        foreign_key_constraint_on: {
+                            column: rel.field,
+                            table: {
+                                name: rel.from,
+                                schema: 'public'
+                            }
                         }
                     }
-                }
-            })
+                })
+            }
         }
         else {
             updateArrayMap(objectRelationships, rel.from, {
-                name: rel.to,
+                name: rel.name,
                 using: {
                     foreign_key_constraint_on: rel.field
                 }
             })
-            updateArrayMap(arrayRelationships, rel.to, {
-                name: rel.from.concat('s'),
-                using: {
-                    foreign_key_constraint_on: {
-                        column: rel.field,
-                        table: {
-                            name: rel.from,
-                            schema: 'public'
+            if (rel.inverseRelationshipName !== undefined) {
+                updateArrayMap(arrayRelationships, rel.to, {
+                    name: rel.inverseRelationshipName,
+                    using: {
+                        foreign_key_constraint_on: {
+                            column: rel.field,
+                            table: {
+                                name: rel.from,
+                                schema: 'public'
+                            }
                         }
                     }
-                }
-            })
+                })
+            }
         }
     }
 
